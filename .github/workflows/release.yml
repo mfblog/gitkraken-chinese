@@ -1,0 +1,173 @@
+# 触发条件：推送新版本 tag（如 12.0.1）
+# 行为：发布 strings.json，同时附带 patcher（有变更则重新编译，无变更则从上一个 release 复用）
+name: Release strings
+
+on:
+  push:
+    tags:
+      - '[0-9]+.[0-9]+.[0-9]+'
+
+permissions:
+  contents: write
+
+jobs:
+  check-patcher:
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.diff.outputs.changed }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Detect patcher changes
+        id: diff
+        shell: bash
+        run: |
+          PREV_TAG=$(git tag --sort=-v:refname | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sed -n '2p')
+          if [[ -z "$PREV_TAG" ]]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            DIFF=$(git diff --name-only "$PREV_TAG" HEAD -- '自动替换脚本/')
+            if [[ -n "$DIFF" ]]; then
+              echo "changed=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "changed=false" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+  build-patcher:
+    needs: check-patcher
+    if: needs.check-patcher.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - rid: win-x64
+            artifact: GitKrakenPatcher_Windows_x64.exe
+          - rid: win-arm64
+            artifact: GitKrakenPatcher_Windows_arm64.exe
+          - rid: linux-x64
+            artifact: GitKrakenPatcher_Linux_x64
+          - rid: linux-arm64
+            artifact: GitKrakenPatcher_Linux_arm64
+          - rid: osx-x64
+            artifact: GitKrakenPatcher_macOS_x64
+          - rid: osx-arm64
+            artifact: GitKrakenPatcher_macOS_arm64
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Publish ${{ matrix.rid }}
+        run: |
+          dotnet publish '自动替换脚本/GitKrakenPatcher.csproj' \
+            -c Release \
+            -r ${{ matrix.rid }} \
+            --self-contained true \
+            /p:PublishSingleFile=true \
+            /p:PublishTrimmed=true \
+            -o ./out
+
+      - name: Rename artifact
+        shell: bash
+        run: |
+          if [[ "${{ matrix.rid }}" == win-* ]]; then
+            mv ./out/GitKrakenPatcher.exe "./out/${{ matrix.artifact }}"
+          else
+            mv ./out/GitKrakenPatcher "./out/${{ matrix.artifact }}"
+          fi
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact }}
+          path: ./out/${{ matrix.artifact }}
+
+  reuse-patcher:
+    needs: check-patcher
+    if: needs.check-patcher.outputs.changed == 'false'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download from latest release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p ./out
+          ARTIFACTS=(
+            "GitKrakenPatcher_Windows_x64.exe"
+            "GitKrakenPatcher_Windows_arm64.exe"
+            "GitKrakenPatcher_Linux_x64"
+            "GitKrakenPatcher_Linux_arm64"
+            "GitKrakenPatcher_macOS_x64"
+            "GitKrakenPatcher_macOS_arm64"
+          )
+          PREV_TAG=$(gh api repos/${{ github.repository }}/releases/latest --jq '.tag_name' 2>/dev/null || echo "")
+          if [[ -z "$PREV_TAG" ]]; then
+            echo "No previous release, skipping"
+            exit 0
+          fi
+          for name in "${ARTIFACTS[@]}"; do
+            gh release download "$PREV_TAG" -p "$name" -D ./out -R "${{ github.repository }}" || true
+          done
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: patcher-reused
+          path: ./out/GitKrakenPatcher_*
+          if-no-files-found: warn
+
+  release:
+    needs: [ check-patcher, build-patcher, reuse-patcher ]
+    if: always() && !failure() && !cancelled()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Prepare strings.json
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+          SRC="strings_${VERSION}.json"
+          if [[ ! -f "$SRC" ]]; then
+            echo "找不到 $SRC"; exit 1
+          fi
+          cp "$SRC" strings.json
+
+      - uses: actions/download-artifact@v8
+        with:
+          path: ./artifacts
+          merge-multiple: true
+
+      - name: Collect release assets
+        shell: bash
+        run: |
+          mkdir -p ./release-assets
+          cp strings.json ./release-assets/
+          find ./artifacts -name "GitKrakenPatcher_*" -exec cp {} ./release-assets/ \; 2>/dev/null || true
+          ls -la ./release-assets/
+
+      - name: Create GitHub release
+        uses: ncipollo/release-action@v1
+        with:
+          tag: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          body: |
+            适配 GitKraken ${{ github.ref_name }} 更新
+
+            ### 自动替换（推荐）
+            1. 下载 `strings.json` 和对应系统的 `GitKrakenPatcher`，放在同一目录下
+            2. 运行 `GitKrakenPatcher`，自动完成替换
+            3. 重启 GitKraken 即可生效
+
+            ### 手动替换
+            下载 `strings.json`，按[操作步骤](https://github.com/${{ github.repository }}/blob/master/README.md#%E6%93%8D%E4%BD%9C%E6%AD%A5%E9%AA%A4)手动替换对应目录下的文件。
+          artifacts: "./release-assets/*"
+          draft: false
+          prerelease: false
+          makeLatest: true
+          allowUpdates: true
+          replacesArtifacts: true
